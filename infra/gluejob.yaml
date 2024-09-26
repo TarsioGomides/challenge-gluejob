@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: s3-glue-job-file-storage
+
+  GlueDatabaseName:
+    Type: String
+    Default: parquet_database
+
+Outputs:
+  S3BucketArn:
+    Description: "ARN do bucket S3"
+    Value: !Sub 'arn:aws:s3:::${S3BucketName}'
+    Export:
+      Name: S3BucketArn 
+  S3BucketName:
+    Description: "Nome do bucket S3"
+    Value: !Ref S3BucketName
+    Export:
+      Name: S3BucketName
+
+  GlueJobArn:
+    Description: "ARN do Glue Job"
+    Value: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${DataCatalogGlueJob}' 
+    Export:
+      Name: GlueJobArn 
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldObjects
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !ImportValue TriggerGlueJobFunctionArn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !ImportValue TriggerGlueJobFunctionArn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GlueJobRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+        - PolicyName: GlueCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  DataCatalogGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: GlueJobRole
+    Properties:
+      Name: parquet-conversion-job
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${S3BucketName}/glue-scripts/gluejob.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-enable
+        '--input_path': !Sub 's3://${S3BucketName}'
+        '--output_path': !Sub 's3://${S3BucketName}/parquet-output/'
+        '--enable-metrics': 'true'      
+        '--enable-continuous-log-filter': 'true' 
+        '--enable-glue-datacatalog': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${S3BucketName}/spark-logs/'
+      GlueVersion: '3.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: AthenaWorkGroup
+      State: ENABLED
+      Description: Athena Workgroup for seeing results by querying
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${S3BucketName}/query-results/'
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: user_table
+        StorageDescriptor:
+          Columns:
+            - Name: person_name
+              Type: string
+            - Name: email
+              Type: string
+          Location: !Sub 's3://${S3BucketName}/parquet-output/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+        TableType: EXTERNAL_TABLE
